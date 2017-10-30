@@ -33,50 +33,35 @@
 
 #include <google/protobuf/pyext/extension_dict.h>
 
+#include <google/protobuf/stubs/logging.h>
 #include <google/protobuf/stubs/common.h>
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/dynamic_message.h>
 #include <google/protobuf/message.h>
+#include <google/protobuf/descriptor.pb.h>
 #include <google/protobuf/pyext/descriptor.h>
 #include <google/protobuf/pyext/message.h>
+#include <google/protobuf/pyext/message_factory.h>
 #include <google/protobuf/pyext/repeated_composite_container.h>
 #include <google/protobuf/pyext/repeated_scalar_container.h>
 #include <google/protobuf/pyext/scoped_pyobject_ptr.h>
 #include <google/protobuf/stubs/shared_ptr.h>
 
+#if PY_MAJOR_VERSION >= 3
+  #if PY_VERSION_HEX < 0x03030000
+    #error "Python 3.0 - 3.2 are not supported."
+  #endif
+  #define PyString_AsStringAndSize(ob, charpp, sizep) \
+    (PyUnicode_Check(ob)? \
+       ((*(charpp) = PyUnicode_AsUTF8AndSize(ob, (sizep))) == NULL? -1: 0): \
+       PyBytes_AsStringAndSize(ob, (charpp), (sizep)))
+#endif
+
 namespace google {
 namespace protobuf {
 namespace python {
 
-extern google::protobuf::DynamicMessageFactory* global_message_factory;
-
 namespace extension_dict {
-
-// TODO(tibell): Always use self->message for clarity, just like in
-// RepeatedCompositeContainer.
-static google::protobuf::Message* GetMessage(ExtensionDict* self) {
-  if (self->parent != NULL) {
-    return self->parent->message;
-  } else {
-    return self->message;
-  }
-}
-
-CFieldDescriptor* InternalGetCDescriptorFromExtension(PyObject* extension) {
-  PyObject* cdescriptor = PyObject_GetAttrString(extension, "_cdescriptor");
-  if (cdescriptor == NULL) {
-    PyErr_SetString(PyExc_KeyError, "Unregistered extension.");
-    return NULL;
-  }
-  if (!PyObject_TypeCheck(cdescriptor, &CFieldDescriptor_Type)) {
-    PyErr_SetString(PyExc_TypeError, "Not a CFieldDescriptor");
-    Py_DECREF(cdescriptor);
-    return NULL;
-  }
-  CFieldDescriptor* descriptor =
-      reinterpret_cast<CFieldDescriptor*>(cdescriptor);
-  return descriptor;
-}
 
 PyObject* len(ExtensionDict* self) {
 #if PY_MAJOR_VERSION >= 3
@@ -86,51 +71,18 @@ PyObject* len(ExtensionDict* self) {
 #endif
 }
 
-// TODO(tibell): Use VisitCompositeField.
-int ReleaseExtension(ExtensionDict* self,
-                     PyObject* extension,
-                     const google::protobuf::FieldDescriptor* descriptor) {
-  if (descriptor->label() == google::protobuf::FieldDescriptor::LABEL_REPEATED) {
-    if (descriptor->cpp_type() ==
-        google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE) {
-      if (repeated_composite_container::Release(
-              reinterpret_cast<RepeatedCompositeContainer*>(
-                  extension)) < 0) {
-        return -1;
-      }
-    } else {
-      if (repeated_scalar_container::Release(
-              reinterpret_cast<RepeatedScalarContainer*>(
-                  extension)) < 0) {
-        return -1;
-      }
-    }
-  } else if (descriptor->cpp_type() ==
-             google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE) {
-    if (cmessage::ReleaseSubMessage(
-            GetMessage(self), descriptor,
-            reinterpret_cast<CMessage*>(extension)) < 0) {
-      return -1;
-    }
-  }
-
-  return 0;
-}
-
 PyObject* subscript(ExtensionDict* self, PyObject* key) {
-  CFieldDescriptor* cdescriptor = InternalGetCDescriptorFromExtension(
-      key);
-  if (cdescriptor == NULL) {
-    return NULL;
-  }
-  ScopedPyObjectPtr py_cdescriptor(reinterpret_cast<PyObject*>(cdescriptor));
-  const google::protobuf::FieldDescriptor* descriptor = cdescriptor->descriptor;
+  const FieldDescriptor* descriptor = cmessage::GetExtensionDescriptor(key);
   if (descriptor == NULL) {
     return NULL;
   }
+  if (!CheckFieldBelongsToMessage(descriptor, self->message)) {
+    return NULL;
+  }
+
   if (descriptor->label() != FieldDescriptor::LABEL_REPEATED &&
       descriptor->cpp_type() != FieldDescriptor::CPPTYPE_MESSAGE) {
-    return cmessage::InternalGetScalar(self->parent, descriptor);
+    return cmessage::InternalGetScalar(self->message, descriptor);
   }
 
   PyObject* value = PyDict_GetItem(self->values, key);
@@ -139,10 +91,19 @@ PyObject* subscript(ExtensionDict* self, PyObject* key) {
     return value;
   }
 
+  if (self->parent == NULL) {
+    // We are in "detached" state. Don't allow further modifications.
+    // TODO(amauryfa): Support adding non-scalars to a detached extension dict.
+    // This probably requires to store the type of the main message.
+    PyErr_SetObject(PyExc_KeyError, key);
+    return NULL;
+  }
+
   if (descriptor->label() != FieldDescriptor::LABEL_REPEATED &&
       descriptor->cpp_type() == FieldDescriptor::CPPTYPE_MESSAGE) {
+    // TODO(plabatut): consider building the class on the fly!
     PyObject* sub_message = cmessage::InternalGetSubMessage(
-        self->parent, cdescriptor);
+        self->parent, descriptor);
     if (sub_message == NULL) {
       return NULL;
     }
@@ -152,33 +113,34 @@ PyObject* subscript(ExtensionDict* self, PyObject* key) {
 
   if (descriptor->label() == FieldDescriptor::LABEL_REPEATED) {
     if (descriptor->cpp_type() == FieldDescriptor::CPPTYPE_MESSAGE) {
-      // COPIED
-      PyObject* py_container = PyObject_CallObject(
-          reinterpret_cast<PyObject*>(&RepeatedCompositeContainer_Type),
-          NULL);
+      // On the fly message class creation is needed to support the following
+      // situation:
+      // 1- add FileDescriptor to the pool that contains extensions of a message
+      //    defined by another proto file. Do not create any message classes.
+      // 2- instantiate an extended message, and access the extension using
+      //    the field descriptor.
+      // 3- the extension submessage fails to be returned, because no class has
+      //    been created.
+      // It happens when deserializing text proto format, or when enumerating
+      // fields of a deserialized message.
+      CMessageClass* message_class = message_factory::GetOrCreateMessageClass(
+          cmessage::GetFactoryForMessage(self->parent),
+          descriptor->message_type());
+      ScopedPyObjectPtr message_class_handler(
+        reinterpret_cast<PyObject*>(message_class));
+      if (message_class == NULL) {
+        return NULL;
+      }
+      PyObject* py_container = repeated_composite_container::NewContainer(
+          self->parent, descriptor, message_class);
       if (py_container == NULL) {
         return NULL;
       }
-      RepeatedCompositeContainer* container =
-          reinterpret_cast<RepeatedCompositeContainer*>(py_container);
-      PyObject* field = cdescriptor->descriptor_field;
-      PyObject* message_type = PyObject_GetAttrString(field, "message_type");
-      PyObject* concrete_class = PyObject_GetAttrString(message_type,
-                                                        "_concrete_class");
-      container->owner = self->owner;
-      container->parent = self->parent;
-      container->message = self->parent->message;
-      container->parent_field = cdescriptor;
-      container->subclass_init = concrete_class;
-      Py_DECREF(message_type);
       PyDict_SetItem(self->values, key, py_container);
       return py_container;
     } else {
-      // COPIED
-      ScopedPyObjectPtr init_args(PyTuple_Pack(2, self->parent, cdescriptor));
-      PyObject* py_container = PyObject_CallObject(
-          reinterpret_cast<PyObject*>(&RepeatedScalarContainer_Type),
-          init_args);
+      PyObject* py_container = repeated_scalar_container::NewContainer(
+          self->parent, descriptor);
       if (py_container == NULL) {
         return NULL;
       }
@@ -191,83 +153,90 @@ PyObject* subscript(ExtensionDict* self, PyObject* key) {
 }
 
 int ass_subscript(ExtensionDict* self, PyObject* key, PyObject* value) {
-  CFieldDescriptor* cdescriptor = InternalGetCDescriptorFromExtension(
-      key);
-  if (cdescriptor == NULL) {
+  const FieldDescriptor* descriptor = cmessage::GetExtensionDescriptor(key);
+  if (descriptor == NULL) {
     return -1;
   }
-  ScopedPyObjectPtr py_cdescriptor(reinterpret_cast<PyObject*>(cdescriptor));
-  const google::protobuf::FieldDescriptor* descriptor = cdescriptor->descriptor;
+  if (!CheckFieldBelongsToMessage(descriptor, self->message)) {
+    return -1;
+  }
+
   if (descriptor->label() != FieldDescriptor::LABEL_OPTIONAL ||
       descriptor->cpp_type() == FieldDescriptor::CPPTYPE_MESSAGE) {
     PyErr_SetString(PyExc_TypeError, "Extension is repeated and/or composite "
                     "type");
     return -1;
   }
-  cmessage::AssureWritable(self->parent);
-  if (cmessage::InternalSetScalar(self->parent, descriptor, value) < 0) {
-    return -1;
+  if (self->parent) {
+    cmessage::AssureWritable(self->parent);
+    if (cmessage::InternalSetScalar(self->parent, descriptor, value) < 0) {
+      return -1;
+    }
   }
   // TODO(tibell): We shouldn't write scalars to the cache.
   PyDict_SetItem(self->values, key, value);
   return 0;
 }
 
-PyObject* ClearExtension(ExtensionDict* self, PyObject* extension) {
-  CFieldDescriptor* cdescriptor = InternalGetCDescriptorFromExtension(
-      extension);
-  if (cdescriptor == NULL) {
+PyObject* _FindExtensionByName(ExtensionDict* self, PyObject* arg) {
+  char* name;
+  Py_ssize_t name_size;
+  if (PyString_AsStringAndSize(arg, &name, &name_size) < 0) {
     return NULL;
   }
-  ScopedPyObjectPtr py_cdescriptor(reinterpret_cast<PyObject*>(cdescriptor));
-  PyObject* value = PyDict_GetItem(self->values, extension);
-  if (value != NULL) {
-    if (ReleaseExtension(self, value, cdescriptor->descriptor) < 0) {
-      return NULL;
+
+  PyDescriptorPool* pool = cmessage::GetFactoryForMessage(self->parent)->pool;
+  const FieldDescriptor* message_extension =
+      pool->pool->FindExtensionByName(string(name, name_size));
+  if (message_extension == NULL) {
+    // Is is the name of a message set extension?
+    const Descriptor* message_descriptor = pool->pool->FindMessageTypeByName(
+        string(name, name_size));
+    if (message_descriptor && message_descriptor->extension_count() > 0) {
+      const FieldDescriptor* extension = message_descriptor->extension(0);
+      if (extension->is_extension() &&
+          extension->containing_type()->options().message_set_wire_format() &&
+          extension->type() == FieldDescriptor::TYPE_MESSAGE &&
+          extension->label() == FieldDescriptor::LABEL_OPTIONAL) {
+        message_extension = extension;
+      }
     }
   }
-  if (cmessage::ClearFieldByDescriptor(self->parent,
-                                       cdescriptor->descriptor) == NULL) {
-    return NULL;
-  }
-  if (PyDict_DelItem(self->values, extension) < 0) {
-    PyErr_Clear();
-  }
-  Py_RETURN_NONE;
-}
-
-PyObject* HasExtension(ExtensionDict* self, PyObject* extension) {
-  CFieldDescriptor* cdescriptor = InternalGetCDescriptorFromExtension(
-      extension);
-  if (cdescriptor == NULL) {
-    return NULL;
-  }
-  ScopedPyObjectPtr py_cdescriptor(reinterpret_cast<PyObject*>(cdescriptor));
-  PyObject* result = cmessage::HasFieldByDescriptor(
-      self->parent, cdescriptor->descriptor);
-  return result;
-}
-
-PyObject* _FindExtensionByName(ExtensionDict* self, PyObject* name) {
-  ScopedPyObjectPtr extensions_by_name(PyObject_GetAttrString(
-      reinterpret_cast<PyObject*>(self->parent), "_extensions_by_name"));
-  if (extensions_by_name == NULL) {
-    return NULL;
-  }
-  PyObject* result = PyDict_GetItem(extensions_by_name, name);
-  if (result == NULL) {
+  if (message_extension == NULL) {
     Py_RETURN_NONE;
-  } else {
-    Py_INCREF(result);
-    return result;
   }
+
+  return PyFieldDescriptor_FromDescriptor(message_extension);
 }
 
-int init(ExtensionDict* self, PyObject* args, PyObject* kwargs) {
-  self->parent = NULL;
-  self->message = NULL;
+PyObject* _FindExtensionByNumber(ExtensionDict* self, PyObject* arg) {
+  int64 number = PyLong_AsLong(arg);
+  if (number == -1 && PyErr_Occurred()) {
+    return NULL;
+  }
+
+  PyDescriptorPool* pool = cmessage::GetFactoryForMessage(self->parent)->pool;
+  const FieldDescriptor* message_extension = pool->pool->FindExtensionByNumber(
+      self->parent->message->GetDescriptor(), number);
+  if (message_extension == NULL) {
+    Py_RETURN_NONE;
+  }
+
+  return PyFieldDescriptor_FromDescriptor(message_extension);
+}
+
+ExtensionDict* NewExtensionDict(CMessage *parent) {
+  ExtensionDict* self = reinterpret_cast<ExtensionDict*>(
+      PyType_GenericAlloc(&ExtensionDict_Type, 0));
+  if (self == NULL) {
+    return NULL;
+  }
+
+  self->parent = parent;  // Store a borrowed reference.
+  self->message = parent->message;
+  self->owner = parent->owner;
   self->values = PyDict_New();
-  return 0;
+  return self;
 }
 
 void dealloc(ExtensionDict* self) {
@@ -284,10 +253,10 @@ static PyMappingMethods MpMethods = {
 
 #define EDMETHOD(name, args, doc) { #name, (PyCFunction)name, args, doc }
 static PyMethodDef Methods[] = {
-  EDMETHOD(ClearExtension, METH_O, "Clears an extension from the object."),
-  EDMETHOD(HasExtension, METH_O, "Checks if the object has an extension."),
   EDMETHOD(_FindExtensionByName, METH_O,
            "Finds an extension by name."),
+  EDMETHOD(_FindExtensionByNumber, METH_O,
+           "Finds an extension by field number."),
   { NULL, NULL }
 };
 
@@ -295,8 +264,7 @@ static PyMethodDef Methods[] = {
 
 PyTypeObject ExtensionDict_Type = {
   PyVarObject_HEAD_INIT(&PyType_Type, 0)
-  "google.protobuf.internal."
-  "cpp._message.ExtensionDict",        // tp_name
+  FULL_MODULE_NAME ".ExtensionDict",   // tp_name
   sizeof(ExtensionDict),               // tp_basicsize
   0,                                   //  tp_itemsize
   (destructor)extension_dict::dealloc,  //  tp_dealloc
@@ -308,7 +276,7 @@ PyTypeObject ExtensionDict_Type = {
   0,                                   //  tp_as_number
   0,                                   //  tp_as_sequence
   &extension_dict::MpMethods,          //  tp_as_mapping
-  0,                                   //  tp_hash
+  PyObject_HashNotImplemented,         //  tp_hash
   0,                                   //  tp_call
   0,                                   //  tp_str
   0,                                   //  tp_getattro
@@ -330,7 +298,7 @@ PyTypeObject ExtensionDict_Type = {
   0,                                   //  tp_descr_get
   0,                                   //  tp_descr_set
   0,                                   //  tp_dictoffset
-  (initproc)extension_dict::init,      //  tp_init
+  0,                                   //  tp_init
 };
 
 }  // namespace python

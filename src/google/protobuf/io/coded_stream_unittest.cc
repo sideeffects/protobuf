@@ -34,6 +34,10 @@
 //
 // This file contains tests and benchmarks.
 
+#include <memory>
+#ifndef _SHARED_PTR_H
+#include <google/protobuf/stubs/shared_ptr.h>
+#endif
 #include <vector>
 
 #include <google/protobuf/io/coded_stream.h>
@@ -41,6 +45,8 @@
 #include <limits.h>
 
 #include <google/protobuf/stubs/common.h>
+#include <google/protobuf/stubs/logging.h>
+#include <google/protobuf/stubs/logging.h>
 #include <google/protobuf/testing/googletest.h>
 #include <gtest/gtest.h>
 #include <google/protobuf/io/zero_copy_stream_impl.h>
@@ -52,9 +58,11 @@
 #define ULL(x) GOOGLE_ULONGLONG(x)
 
 namespace google {
+
 namespace protobuf {
 namespace io {
 namespace {
+
 
 // ===================================================================
 // Data-Driven Test Infrastructure
@@ -128,7 +136,7 @@ class CodedStreamTest : public testing::Test {
   // for further information.
   static void SetupTotalBytesLimitWarningTest(
       int total_bytes_limit, int warning_threshold,
-      vector<string>* out_errors, vector<string>* out_warnings);
+      std::vector<string>* out_errors, std::vector<string>* out_warnings);
 
   // Buffer used during most of the tests. This assumes tests run sequentially.
   static const int kBufferSize = 1024 * 64;
@@ -143,6 +151,7 @@ uint8 CodedStreamTest::buffer_[CodedStreamTest::kBufferSize];
 // we can use special optimized paths that don't worry about bounds
 // checks.
 const int kBlockSizes[] = {1, 2, 3, 5, 7, 13, 32, 1024};
+
 
 // -------------------------------------------------------------------
 // Varint tests.
@@ -237,7 +246,7 @@ TEST_F(CodedStreamTest, EmptyInputBeforeEos) {
     int count_;
   } in;
   CodedInputStream input(&in);
-  input.ReadTag();
+  input.ReadTagNoLastTag();
   EXPECT_TRUE(input.ConsumedEntireMessage());
 }
 
@@ -438,6 +447,21 @@ TEST_2D(CodedStreamTest, ReadVarint32Error, kVarintErrorCases, kBlockSizes) {
   EXPECT_EQ(kVarintErrorCases_case.can_parse, coded_input.ReadVarint32(&value));
 }
 
+TEST_2D(CodedStreamTest, ReadVarint32Error_LeavesValueInInitializedState,
+        kVarintErrorCases, kBlockSizes) {
+  memcpy(buffer_, kVarintErrorCases_case.bytes, kVarintErrorCases_case.size);
+  ArrayInputStream input(buffer_, kVarintErrorCases_case.size,
+                         kBlockSizes_case);
+  CodedInputStream coded_input(&input);
+
+  uint32 value = 0;
+  EXPECT_EQ(kVarintErrorCases_case.can_parse, coded_input.ReadVarint32(&value));
+  // While the specific value following a failure is not critical, we do want to
+  // ensure that it doesn't get set to an uninitialized value. (This check fails
+  // in MSAN mode if value has been set to an uninitialized value.)
+  EXPECT_EQ(value, value);
+}
+
 TEST_2D(CodedStreamTest, ReadVarint64Error, kVarintErrorCases, kBlockSizes) {
   memcpy(buffer_, kVarintErrorCases_case.bytes, kVarintErrorCases_case.size);
   ArrayInputStream input(buffer_, kVarintErrorCases_case.size,
@@ -446,6 +470,21 @@ TEST_2D(CodedStreamTest, ReadVarint64Error, kVarintErrorCases, kBlockSizes) {
 
   uint64 value;
   EXPECT_EQ(kVarintErrorCases_case.can_parse, coded_input.ReadVarint64(&value));
+}
+
+TEST_2D(CodedStreamTest, ReadVarint64Error_LeavesValueInInitializedState,
+        kVarintErrorCases, kBlockSizes) {
+  memcpy(buffer_, kVarintErrorCases_case.bytes, kVarintErrorCases_case.size);
+  ArrayInputStream input(buffer_, kVarintErrorCases_case.size,
+                         kBlockSizes_case);
+  CodedInputStream coded_input(&input);
+
+  uint64 value = 0;
+  EXPECT_EQ(kVarintErrorCases_case.can_parse, coded_input.ReadVarint64(&value));
+  // While the specific value following a failure is not critical, we do want to
+  // ensure that it doesn't get set to an uninitialized value. (This check fails
+  // in MSAN mode if value has been set to an uninitialized value.)
+  EXPECT_EQ(value, value);
 }
 
 // -------------------------------------------------------------------
@@ -487,6 +526,28 @@ TEST_1D(CodedStreamTest, VarintSize64, kVarintSizeCases) {
     CodedOutputStream::VarintSize64(kVarintSizeCases_case.value));
 }
 
+TEST_F(CodedStreamTest, VarintSize32PowersOfTwo) {
+  int expected = 1;
+  for (int i = 1; i < 32; i++) {
+    if (i % 7 == 0) {
+      expected += 1;
+    }
+    EXPECT_EQ(expected,
+              CodedOutputStream::VarintSize32(static_cast<uint32>(0x1u << i)));
+  }
+}
+
+TEST_F(CodedStreamTest, VarintSize64PowersOfTwo) {
+  int expected = 1;
+  for (int i = 1; i < 64; i++) {
+    if (i % 7 == 0) {
+      expected += 1;
+    }
+    EXPECT_EQ(expected, CodedOutputStream::VarintSize64(
+                            static_cast<uint64>(0x1ull << i)));
+  }
+}
+
 // -------------------------------------------------------------------
 // Fixed-size int tests
 
@@ -501,11 +562,11 @@ struct Fixed64Case {
 };
 
 inline std::ostream& operator<<(std::ostream& os, const Fixed32Case& c) {
-  return os << "0x" << hex << c.value << dec;
+  return os << "0x" << std::hex << c.value << std::dec;
 }
 
 inline std::ostream& operator<<(std::ostream& os, const Fixed64Case& c) {
-  return os << "0x" << hex << c.value << dec;
+  return os << "0x" << std::hex << c.value << std::dec;
 }
 
 Fixed32Case kFixed32Cases[] = {
@@ -676,7 +737,7 @@ TEST_F(CodedStreamTest, ReadStringImpossiblyLargeFromStringOnStack) {
 }
 
 TEST_F(CodedStreamTest, ReadStringImpossiblyLargeFromStringOnHeap) {
-  scoped_array<uint8> buffer(new uint8[8]);
+  google::protobuf::scoped_array<uint8> buffer(new uint8[8]);
   CodedInputStream coded_input(buffer.get(), 8);
   string str;
   EXPECT_FALSE(coded_input.ReadString(&str, 1 << 30));
@@ -1169,7 +1230,7 @@ TEST_F(CodedStreamTest, TotalBytesLimit) {
   EXPECT_TRUE(coded_input.ReadString(&str, 16));
   EXPECT_EQ(0, coded_input.BytesUntilTotalBytesLimit());
 
-  vector<string> errors;
+  std::vector<string> errors;
 
   {
     ScopedMemoryLog error_log;
@@ -1203,7 +1264,7 @@ TEST_F(CodedStreamTest, TotalBytesLimitNotValidMessageEnd) {
 
   // Read a tag.  Should fail, but report being a valid endpoint since it's
   // a regular limit.
-  EXPECT_EQ(0, coded_input.ReadTag());
+  EXPECT_EQ(0, coded_input.ReadTagNoLastTag());
   EXPECT_TRUE(coded_input.ConsumedEntireMessage());
 
   // Pop the limit.
@@ -1211,7 +1272,7 @@ TEST_F(CodedStreamTest, TotalBytesLimitNotValidMessageEnd) {
 
   // Read a tag.  Should fail, and report *not* being a valid endpoint, since
   // this time we're hitting the total bytes limit.
-  EXPECT_EQ(0, coded_input.ReadTag());
+  EXPECT_EQ(0, coded_input.ReadTagNoLastTag());
   EXPECT_FALSE(coded_input.ConsumedEntireMessage());
 }
 
@@ -1221,7 +1282,7 @@ TEST_F(CodedStreamTest, TotalBytesLimitNotValidMessageEnd) {
 // vectors.
 void CodedStreamTest::SetupTotalBytesLimitWarningTest(
     int total_bytes_limit, int warning_threshold,
-    vector<string>* out_errors, vector<string>* out_warnings) {
+    std::vector<string>* out_errors, std::vector<string>* out_warnings) {
   ArrayInputStream raw_input(buffer_, sizeof(buffer_), 128);
 
   ScopedMemoryLog scoped_log;
@@ -1235,39 +1296,6 @@ void CodedStreamTest::SetupTotalBytesLimitWarningTest(
   *out_errors = scoped_log.GetMessages(ERROR);
   *out_warnings = scoped_log.GetMessages(WARNING);
 }
-
-TEST_F(CodedStreamTest, TotalBytesLimitWarning) {
-  vector<string> errors;
-  vector<string> warnings;
-  SetupTotalBytesLimitWarningTest(10240, 1024, &errors, &warnings);
-
-  EXPECT_EQ(0, errors.size());
-
-  ASSERT_EQ(2, warnings.size());
-  EXPECT_PRED_FORMAT2(testing::IsSubstring,
-    "Reading dangerously large protocol message.  If the message turns out to "
-    "be larger than 10240 bytes, parsing will be halted for security reasons.",
-    warnings[0]);
-  EXPECT_PRED_FORMAT2(testing::IsSubstring,
-    "The total number of bytes read was 2048",
-    warnings[1]);
-}
-
-TEST_F(CodedStreamTest, TotalBytesLimitWarningDisabled) {
-  vector<string> errors;
-  vector<string> warnings;
-
-  // Test with -1
-  SetupTotalBytesLimitWarningTest(10240, -1, &errors, &warnings);
-  EXPECT_EQ(0, errors.size());
-  EXPECT_EQ(0, warnings.size());
-
-  // Test again with -2, expecting the same result
-  SetupTotalBytesLimitWarningTest(10240, -2, &errors, &warnings);
-  EXPECT_EQ(0, errors.size());
-  EXPECT_EQ(0, warnings.size());
-}
-
 
 TEST_F(CodedStreamTest, RecursionLimit) {
   ArrayInputStream input(buffer_, sizeof(buffer_));
@@ -1354,7 +1382,7 @@ TEST_F(CodedStreamTest, InputOver2G) {
   // input.BackUp() with the correct number of bytes on destruction.
   ReallyBigInputStream input;
 
-  vector<string> errors;
+  std::vector<string> errors;
 
   {
     ScopedMemoryLog error_log;
@@ -1368,9 +1396,6 @@ TEST_F(CodedStreamTest, InputOver2G) {
   EXPECT_EQ(INT_MAX - 512, input.backup_amount_);
   EXPECT_EQ(0, errors.size());
 }
-
-// ===================================================================
-
 
 }  // namespace
 }  // namespace io

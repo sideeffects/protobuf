@@ -32,19 +32,22 @@
 //  Based on original Protocol Buffers design by
 //  Sanjay Ghemawat, Jeff Dean, and others.
 
+
+#include <google/protobuf/stubs/strutil.h>
 #include <google/protobuf/extension_set.h>
 #include <google/protobuf/unittest.pb.h>
 #include <google/protobuf/unittest_mset.pb.h>
 #include <google/protobuf/test_util.h>
 #include <google/protobuf/descriptor.pb.h>
+#include <google/protobuf/arena.h>
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/dynamic_message.h>
 #include <google/protobuf/wire_format.h>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl.h>
 
+#include <google/protobuf/stubs/logging.h>
 #include <google/protobuf/stubs/common.h>
-#include <google/protobuf/stubs/strutil.h>
 #include <google/protobuf/testing/googletest.h>
 #include <gtest/gtest.h>
 #include <google/protobuf/stubs/stl_util.h>
@@ -172,7 +175,7 @@ TEST(ExtensionSetTest, SetAllocatedExtension) {
 }
 
 TEST(ExtensionSetTest, ReleaseExtension) {
-  unittest::TestMessageSet message;
+  proto2_wireformat_unittest::TestMessageSet message;
   EXPECT_FALSE(message.HasExtension(
       unittest::TestMessageSetExtension1::message_set_extension));
   // Add a extension using SetAllocatedExtension
@@ -201,6 +204,74 @@ TEST(ExtensionSetTest, ReleaseExtension) {
       unittest::TestMessageSetExtension1::message_set_extension);
   EXPECT_TRUE(released_extension != NULL);
   delete released_extension;
+}
+
+TEST(ExtensionSetTest, ArenaUnsafeArenaSetAllocatedAndRelease) {
+  ::google::protobuf::Arena arena;
+  unittest::TestAllExtensions* message =
+      ::google::protobuf::Arena::CreateMessage<unittest::TestAllExtensions>(&arena);
+  unittest::ForeignMessage extension;
+  message->UnsafeArenaSetAllocatedExtension(
+      unittest::optional_foreign_message_extension,
+      &extension);
+  // No copy when set.
+  unittest::ForeignMessage* mutable_extension =
+      message->MutableExtension(unittest::optional_foreign_message_extension);
+  EXPECT_EQ(&extension, mutable_extension);
+  // No copy when unsafe released.
+  unittest::ForeignMessage* released_extension =
+      message->UnsafeArenaReleaseExtension(
+          unittest::optional_foreign_message_extension);
+  EXPECT_EQ(&extension, released_extension);
+  EXPECT_FALSE(message->HasExtension(
+      unittest::optional_foreign_message_extension));
+  // Set the ownership back and let the destructors run.  It should not take
+  // ownership, so this should not crash.
+  message->UnsafeArenaSetAllocatedExtension(
+      unittest::optional_foreign_message_extension,
+      &extension);
+}
+
+TEST(ExtensionSetTest, UnsafeArenaSetAllocatedAndRelease) {
+  unittest::TestAllExtensions message;
+  unittest::ForeignMessage* extension = new unittest::ForeignMessage();
+  message.UnsafeArenaSetAllocatedExtension(
+      unittest::optional_foreign_message_extension,
+      extension);
+  // No copy when set.
+  unittest::ForeignMessage* mutable_extension =
+      message.MutableExtension(unittest::optional_foreign_message_extension);
+  EXPECT_EQ(extension, mutable_extension);
+  // No copy when unsafe released.
+  unittest::ForeignMessage* released_extension =
+      message.UnsafeArenaReleaseExtension(
+          unittest::optional_foreign_message_extension);
+  EXPECT_EQ(extension, released_extension);
+  EXPECT_FALSE(message.HasExtension(
+      unittest::optional_foreign_message_extension));
+  // Set the ownership back and let the destructors run.  It should take
+  // ownership, so this should not leak.
+  message.UnsafeArenaSetAllocatedExtension(
+      unittest::optional_foreign_message_extension,
+      extension);
+}
+
+TEST(ExtensionSetTest, ArenaUnsafeArenaReleaseOfHeapAlloc) {
+  ::google::protobuf::Arena arena;
+  unittest::TestAllExtensions* message =
+      ::google::protobuf::Arena::CreateMessage<unittest::TestAllExtensions>(&arena);
+  unittest::ForeignMessage* extension = new unittest::ForeignMessage;
+  message->SetAllocatedExtension(
+      unittest::optional_foreign_message_extension,
+      extension);
+  // The arena should maintain ownership of the heap allocated proto because we
+  // used UnsafeArenaReleaseExtension.  The leak checker will ensure this.
+  unittest::ForeignMessage* released_extension =
+      message->UnsafeArenaReleaseExtension(
+          unittest::optional_foreign_message_extension);
+  EXPECT_EQ(extension, released_extension);
+  EXPECT_FALSE(message->HasExtension(
+      unittest::optional_foreign_message_extension));
 }
 
 
@@ -261,7 +332,7 @@ TEST(ExtensionSetTest, SwapExtension) {
   unittest::TestAllExtensions message2;
 
   TestUtil::SetAllExtensions(&message1);
-  vector<const FieldDescriptor*> fields;
+  std::vector<const FieldDescriptor*> fields;
 
   // Swap empty fields.
   const Reflection* reflection = message1.GetReflection();
@@ -293,7 +364,7 @@ TEST(ExtensionSetTest, SwapExtensionWithEmpty) {
   TestUtil::SetAllExtensions(&message3);
 
   const Reflection* reflection = message3.GetReflection();
-  vector<const FieldDescriptor*> fields;
+  std::vector<const FieldDescriptor*> fields;
   reflection->ListFields(message3, &fields);
 
   reflection->SwapFields(&message1, &message2, fields);
@@ -310,7 +381,7 @@ TEST(ExtensionSetTest, SwapExtensionBothFull) {
   TestUtil::SetAllExtensions(&message2);
 
   const Reflection* reflection = message1.GetReflection();
-  vector<const FieldDescriptor*> fields;
+  std::vector<const FieldDescriptor*> fields;
   reflection->ListFields(message1, &fields);
 
   reflection->SwapFields(&message1, &message2, fields);
@@ -319,12 +390,122 @@ TEST(ExtensionSetTest, SwapExtensionBothFull) {
   TestUtil::ExpectAllExtensionsSet(message2);
 }
 
+TEST(ExtensionSetTest, ArenaSetAllExtension) {
+  ::google::protobuf::Arena arena1;
+  unittest::TestAllExtensions* message1 =
+      ::google::protobuf::Arena::CreateMessage<unittest::TestAllExtensions>(&arena1);
+  TestUtil::SetAllExtensions(message1);
+  TestUtil::ExpectAllExtensionsSet(*message1);
+}
+
+TEST(ExtensionSetTest, ArenaCopyConstructor) {
+  ::google::protobuf::Arena arena1;
+  unittest::TestAllExtensions* message1 =
+      ::google::protobuf::Arena::CreateMessage<unittest::TestAllExtensions>(&arena1);
+  TestUtil::SetAllExtensions(message1);
+  unittest::TestAllExtensions message2(*message1);
+  arena1.Reset();
+  TestUtil::ExpectAllExtensionsSet(message2);
+}
+
+TEST(ExtensionSetTest, ArenaMergeFrom) {
+  ::google::protobuf::Arena arena1;
+  unittest::TestAllExtensions* message1 =
+      ::google::protobuf::Arena::CreateMessage<unittest::TestAllExtensions>(&arena1);
+  TestUtil::SetAllExtensions(message1);
+  unittest::TestAllExtensions message2;
+  message2.MergeFrom(*message1);
+  arena1.Reset();
+  TestUtil::ExpectAllExtensionsSet(message2);
+}
+
+TEST(ExtensionSetTest, ArenaSetAllocatedMessageAndRelease) {
+  ::google::protobuf::Arena arena;
+  unittest::TestAllExtensions* message =
+      ::google::protobuf::Arena::CreateMessage<unittest::TestAllExtensions>(&arena);
+  EXPECT_FALSE(message->HasExtension(
+      unittest::optional_foreign_message_extension));
+  // Add a extension using SetAllocatedExtension
+  unittest::ForeignMessage* foreign_message = new unittest::ForeignMessage();
+  message->SetAllocatedExtension(unittest::optional_foreign_message_extension,
+                                 foreign_message);
+  // foreign_message is now owned by the arena.
+  EXPECT_EQ(foreign_message,
+            message->MutableExtension(
+                unittest::optional_foreign_message_extension));
+
+  // Underlying message is copied, and returned.
+  unittest::ForeignMessage* released_message = message->ReleaseExtension(
+      unittest::optional_foreign_message_extension);
+  delete released_message;
+  EXPECT_FALSE(message->HasExtension(
+      unittest::optional_foreign_message_extension));
+}
+
+TEST(ExtensionSetTest, SwapExtensionBothFullWithArena) {
+  ::google::protobuf::Arena arena1;
+  google::protobuf::scoped_ptr<google::protobuf::Arena> arena2(new ::google::protobuf::Arena());
+
+  unittest::TestAllExtensions* message1 =
+      Arena::CreateMessage<unittest::TestAllExtensions>(&arena1);
+  unittest::TestAllExtensions* message2 =
+      Arena::CreateMessage<unittest::TestAllExtensions>(arena2.get());
+
+  TestUtil::SetAllExtensions(message1);
+  TestUtil::SetAllExtensions(message2);
+  message1->SetExtension(unittest::optional_int32_extension, 1);
+  message2->SetExtension(unittest::optional_int32_extension, 2);
+  message1->Swap(message2);
+  EXPECT_EQ(2, message1->GetExtension(unittest::optional_int32_extension));
+  EXPECT_EQ(1, message2->GetExtension(unittest::optional_int32_extension));
+  // Re-set the original values so ExpectAllExtensionsSet is happy.
+  message1->SetExtension(unittest::optional_int32_extension, 101);
+  message2->SetExtension(unittest::optional_int32_extension, 101);
+  TestUtil::ExpectAllExtensionsSet(*message1);
+  TestUtil::ExpectAllExtensionsSet(*message2);
+  arena2.reset(NULL);
+  TestUtil::ExpectAllExtensionsSet(*message1);
+  // Test corner cases, when one is empty and other is not.
+  ::google::protobuf::Arena arena3, arena4;
+
+  unittest::TestAllExtensions* message3 =
+      Arena::CreateMessage<unittest::TestAllExtensions>(&arena3);
+  unittest::TestAllExtensions* message4 =
+      Arena::CreateMessage<unittest::TestAllExtensions>(&arena4);
+  TestUtil::SetAllExtensions(message3);
+  message3->Swap(message4);
+  arena3.Reset();
+  TestUtil::ExpectAllExtensionsSet(*message4);
+}
+
+TEST(ExtensionSetTest, SwapFieldsOfExtensionBothFullWithArena) {
+  google::protobuf::Arena arena1;
+  google::protobuf::Arena* arena2 = new ::google::protobuf::Arena();
+
+  unittest::TestAllExtensions* message1 =
+      Arena::CreateMessage<unittest::TestAllExtensions>(&arena1);
+  unittest::TestAllExtensions* message2 =
+      Arena::CreateMessage<unittest::TestAllExtensions>(arena2);
+
+  TestUtil::SetAllExtensions(message1);
+  TestUtil::SetAllExtensions(message2);
+
+  const Reflection* reflection = message1->GetReflection();
+  std::vector<const FieldDescriptor*> fields;
+  reflection->ListFields(*message1, &fields);
+  reflection->SwapFields(message1, message2, fields);
+  TestUtil::ExpectAllExtensionsSet(*message1);
+  TestUtil::ExpectAllExtensionsSet(*message2);
+  delete arena2;
+  TestUtil::ExpectAllExtensionsSet(*message1);
+}
+
 TEST(ExtensionSetTest, SwapExtensionWithSelf) {
   unittest::TestAllExtensions message1;
 
   TestUtil::SetAllExtensions(&message1);
 
-  vector<const FieldDescriptor*> fields;
+  std::vector<const FieldDescriptor*> fields;
   const Reflection* reflection = message1.GetReflection();
   reflection->ListFields(message1, &fields);
   reflection->SwapFields(&message1, &message1, fields);
@@ -616,7 +797,7 @@ TEST(ExtensionSetTest, SpaceUsedExcludingSelf) {
     }                                                                          \
     int expected_size = sizeof(cpptype) * (16 -                                \
         kMinRepeatedFieldAllocationSize) + empty_repeated_field_size;          \
-    EXPECT_EQ(expected_size, message.SpaceUsed()) << #type;                    \
+    EXPECT_LE(expected_size, message.SpaceUsed()) << #type;                    \
   } while (0)
 
   TEST_REPEATED_EXTENSIONS_SPACE_USED(int32   , int32 , 101);
